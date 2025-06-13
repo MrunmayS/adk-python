@@ -291,9 +291,13 @@ class LlmAgent(BaseAgent):
     This method is only for use by Agent Development Kit.
     """
     if isinstance(self.model, BaseLlm):
+      # Auto-configure remote MCP servers if LangDB LLM
+      self._configure_remote_mcp_servers(self.model)
       return self.model
     elif self.model:  # model is non-empty str
-      return LLMRegistry.new_llm(self.model)
+      model = LLMRegistry.new_llm(self.model)
+      self._configure_remote_mcp_servers(model)
+      return model
     else:  # find model from ancestors.
       ancestor_agent = self.parent_agent
       while ancestor_agent is not None:
@@ -301,6 +305,45 @@ class LlmAgent(BaseAgent):
           return ancestor_agent.canonical_model
         ancestor_agent = ancestor_agent.parent_agent
       raise ValueError(f'No model found for {self.name}.')
+
+  def _configure_remote_mcp_servers(self, model: BaseLlm) -> None:
+    """Auto-configure remote MCP servers for LangDB LLM if RemoteMCPToolsets are present.
+    
+    Args:
+      model: The LLM model to potentially configure.
+    """
+    # Check if this is a LangDB LLM
+    try:
+      from ..models.langdb_llm import LangDBLlm
+      from ..tools.mcp_tool.remote_mcp_toolset import RemoteMCPToolset
+      
+      if not isinstance(model, LangDBLlm):
+        return  # Only configure LangDB LLMs
+      
+      # Collect MCP server configs from RemoteMCPToolsets
+      mcp_servers = []
+      for tool_union in self.tools:
+        if isinstance(tool_union, RemoteMCPToolset):
+          mcp_servers.extend(tool_union.get_mcp_servers_config())
+      
+      # If we found MCP servers and the model doesn't already have them configured
+      if mcp_servers:
+        if model.mcp_servers:
+          # Merge with existing servers, avoiding duplicates
+          existing_urls = {server.get('server_url') for server in model.mcp_servers}
+          new_servers = [server for server in mcp_servers 
+                        if server.get('server_url') not in existing_urls]
+          if new_servers:
+            model.mcp_servers.extend(new_servers)
+            logger.info(f"Auto-configured {len(new_servers)} additional remote MCP servers for {model.model}")
+        else:
+          # Set MCP servers for the first time
+          model.mcp_servers = mcp_servers
+          logger.info(f"Auto-configured {len(mcp_servers)} remote MCP servers for {model.model}")
+    
+    except ImportError:
+      # RemoteMCPToolset or LangDBLlm not available, skip auto-configuration
+      pass
 
   async def canonical_instruction(
       self, ctx: ReadonlyContext

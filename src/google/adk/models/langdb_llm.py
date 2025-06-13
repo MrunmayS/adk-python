@@ -472,9 +472,11 @@ class LangDBLlm(BaseLlm):
   project_id: Optional[str] = Field(default=None, description="The project ID")
   extra_headers: Dict[str, str] = Field(default_factory=dict, description="Additional headers")
   client: LangDBClient = Field(default=None, description="The HTTP client")
+  mcp_servers: Optional[list[Dict[str, Any]]] = Field(default=None, description="Remote MCP server configurations")
   
   def __init__(self, model_name: str, api_key: str, base_url: Optional[str] = None, 
-               project_id: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None, **kwargs):
+               project_id: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None,
+               mcp_servers: Optional[list[Dict[str, Any]]] = None, **kwargs):
     """Initialize LangDB LLM.
     
     Args:
@@ -483,6 +485,7 @@ class LangDBLlm(BaseLlm):
       base_url: The base URL for LangDB API (optional).
       project_id: The project ID (optional).
       extra_headers: Additional headers to include in requests (optional).
+      mcp_servers: Remote MCP server configurations (optional).
       **kwargs: Additional arguments.
     """
     # Handle project_id in headers
@@ -497,6 +500,7 @@ class LangDBLlm(BaseLlm):
       base_url=base_url or _DEFAULT_BASE_URL,
       project_id=project_id,
       extra_headers=headers,
+      mcp_servers=mcp_servers,
       **kwargs
     )
     
@@ -507,6 +511,56 @@ class LangDBLlm(BaseLlm):
       extra_headers=self.extra_headers
     )
   
+  def _is_remote_mcp_tool(self, function_name: str) -> bool:
+    """Check if a function name indicates a remote MCP tool.
+    
+    Args:
+      function_name: The name of the function to check.
+      
+    Returns:
+      True if this appears to be a remote MCP tool name.
+    """
+    # Common patterns for remote MCP tool names
+    mcp_patterns = [
+      '-mcp---',     # tavily-mcp---tavily-search
+      'mcp_',        # mcp_search
+      '_mcp_',       # tool_mcp_search
+      'mcp-',        # mcp-tool-name
+      '-mcp-',       # tool-mcp-search
+    ]
+    
+    function_name_lower = function_name.lower()
+    return any(pattern in function_name_lower for pattern in mcp_patterns)
+  
+  def _filter_remote_mcp_function_calls(self, content: types.Content) -> types.Content:
+    """Filter out remote MCP function calls from content to prevent local execution.
+    
+    When MCP servers are configured, LangDB executes MCP tools remotely but still
+    returns function call responses. We need to filter these out to prevent ADK
+    from trying to execute them locally.
+    
+    Args:
+      content: The content that may contain function calls.
+      
+    Returns:
+      Content with remote MCP function calls filtered out.
+    """
+    if not self.mcp_servers or not content.parts:
+      return content  # No MCP servers or no parts to filter
+    
+    filtered_parts = []
+    for part in content.parts:
+      if part.function_call and self._is_remote_mcp_tool(part.function_call.name):
+        # Skip remote MCP function calls - they're executed on LangDB
+        logger.debug(f"Filtered remote MCP tool call: {part.function_call.name}")
+        continue
+      else:
+        # Keep local function calls and text parts
+        filtered_parts.append(part)
+    
+    # Return content with filtered parts
+    return types.Content(role=content.role, parts=filtered_parts)
+
   @override
   async def generate_content_async(
       self, llm_request: LlmRequest, stream: bool = False
@@ -531,6 +585,10 @@ class LangDBLlm(BaseLlm):
     
     if tools:
       payload["tools"] = tools
+    
+    # Add MCP servers from instance configuration (auto-configured by Agent)
+    if self.mcp_servers:
+      payload["mcp_servers"] = self.mcp_servers
     
     try:
       if stream:
@@ -592,20 +650,29 @@ class LangDBLlm(BaseLlm):
               )
               text = ""
         
-        # Yield final responses with usage metadata
+        # Yield final responses with usage metadata, filtering remote MCP tools
         if aggregated_response:
           if usage_metadata:
             aggregated_response.usage_metadata = usage_metadata
+          # Filter remote MCP function calls from response
+          aggregated_response.content = self._filter_remote_mcp_function_calls(aggregated_response.content)
           yield aggregated_response
         
         if aggregated_tool_response:
           if usage_metadata and not aggregated_response:
             aggregated_tool_response.usage_metadata = usage_metadata
-          yield aggregated_tool_response
+          # Filter remote MCP function calls from tool response
+          aggregated_tool_response.content = self._filter_remote_mcp_function_calls(aggregated_tool_response.content)
+          # Only yield if there are still function calls after filtering
+          if aggregated_tool_response.content.parts:
+            yield aggregated_tool_response
       
       else:
         response = await self.client.chat_completion(payload, stream=False)
-        yield _langdb_response_to_llm_response(response)
+        llm_response = _langdb_response_to_llm_response(response)
+        # Filter remote MCP function calls from non-streaming response
+        llm_response.content = self._filter_remote_mcp_function_calls(llm_response.content)
+        yield llm_response
     
     except Exception as e:
       logger.error(f"Error in LangDB API call: {e}")
@@ -624,7 +691,8 @@ class LangDBLlm(BaseLlm):
 
 # Factory function for convenience
 def langdb_llm(model_name: str, api_key: str, base_url: Optional[str] = None,
-               project_id: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> LangDBLlm:
+               project_id: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None,
+               mcp_servers: Optional[list[Dict[str, Any]]] = None) -> LangDBLlm:
   """Factory function to create a LangDB LLM instance.
   
   Args:
@@ -633,6 +701,7 @@ def langdb_llm(model_name: str, api_key: str, base_url: Optional[str] = None,
     base_url: The base URL for LangDB API (optional).
     project_id: The project ID (optional).
     extra_headers: Additional headers to include in requests (optional).
+    mcp_servers: Remote MCP server configurations (optional).
     
   Returns:
     A configured LangDBLlm instance.
@@ -642,5 +711,6 @@ def langdb_llm(model_name: str, api_key: str, base_url: Optional[str] = None,
     api_key=api_key,
     base_url=base_url,
     project_id=project_id,
-    extra_headers=extra_headers
+    extra_headers=extra_headers,
+    mcp_servers=mcp_servers
   )
