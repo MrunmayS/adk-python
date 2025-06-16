@@ -219,6 +219,38 @@ def _content_to_langdb_message(content: types.Content) -> Dict[str, Any]:
   return message
 
 
+def _normalize_schema_types(schema_dict: Dict[str, Any]) -> Dict[str, Any]:
+  """Recursively normalize type fields to lowercase for JSON Schema compatibility.
+  
+  Args:
+    schema_dict: The schema dictionary to normalize.
+    
+  Returns:
+    The normalized schema dictionary.
+  """
+  if "type" in schema_dict:
+    schema_dict["type"] = schema_dict["type"].lower()
+  
+  # Handle nested properties
+  if "properties" in schema_dict:
+    for prop_key, prop_value in schema_dict["properties"].items():
+      if isinstance(prop_value, dict):
+        schema_dict["properties"][prop_key] = _normalize_schema_types(prop_value)
+  
+  # Handle array items
+  if "items" in schema_dict and isinstance(schema_dict["items"], dict):
+    schema_dict["items"] = _normalize_schema_types(schema_dict["items"])
+  
+  # Handle anyOf (union types)
+  if "any_of" in schema_dict and isinstance(schema_dict["any_of"], list):
+    schema_dict["any_of"] = [
+      _normalize_schema_types(item) if isinstance(item, dict) else item
+      for item in schema_dict["any_of"]
+    ]
+  
+  return schema_dict
+
+
 def _function_declaration_to_langdb_tool(func_decl: types.FunctionDeclaration) -> Dict[str, Any]:
   """Convert a types.FunctionDeclaration to LangDB tool format.
   
@@ -240,8 +272,8 @@ def _function_declaration_to_langdb_tool(func_decl: types.FunctionDeclaration) -
     properties = {}
     for key, value in func_decl.parameters.properties.items():
       prop = value.model_dump(exclude_none=True)
-      if "type" in prop:
-        prop["type"] = prop["type"].lower()
+      # Recursively normalize types to ensure JSON Schema compatibility
+      prop = _normalize_schema_types(prop)
       properties[key] = prop
     
     tool["function"]["parameters"] = {
